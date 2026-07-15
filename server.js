@@ -80,11 +80,14 @@ async function guardarLogCrudo(pagos) {
 }
 
 // Punto de partida: el pago más reciente que ya tenemos guardado, o hace
-// 30 días si es la primera vez que corre
+// 30 días si es la primera vez que corre. MP exige el formato exacto
+// yyyy-MM-dd'T'HH:mm:ss.SSSZ (con milisegundos) — la fecha que devuelve
+// Supabase no siempre viene en ese formato exacto, así que la
+// reconstruimos con un Date real para asegurar que sea válida
 async function calcularFechaDesde() {
   const { data } = await sb.schema('ops').from('reserva_mp_raw_log')
     .select('fecha').order('fecha', { ascending: false }).limit(1).maybeSingle();
-  if (data?.fecha) return data.fecha;
+  if (data?.fecha) return new Date(data.fecha).toISOString();
   const hace30 = new Date();
   hace30.setDate(hace30.getDate() - 30);
   return hace30.toISOString();
