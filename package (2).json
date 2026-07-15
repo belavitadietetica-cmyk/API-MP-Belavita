@@ -1,0 +1,14 @@
+{
+  "name": "belavita-mp-sync",
+  "version": "1.0.0",
+  "description": "Sincroniza movimientos de la cuenta de Mercado Pago de Belavita con Supabase — arranca en modo diagnóstico (guarda todo en una tabla aparte para revisar antes de tocar la Reserva Belavita)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "@supabase/supabase-js": "^2.45.0",
+    "node-fetch": "^2.7.0"
+  }
+}
