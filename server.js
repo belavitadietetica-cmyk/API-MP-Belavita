@@ -116,6 +116,7 @@ async function clasificarYAplicarReserva() {
   const filasLedger = pendientes.map(p => ({
     monto: p.monto,
     motivo: 'Automático · Mercado Pago (reserva)',
+    fecha: p.fecha ? new Date(p.fecha).toISOString().split('T')[0] : null,
     origen_mp_payment_id: p.mp_payment_id,
   }));
   const { error: errorInsert } = await sb.schema('ops').from('reserva_mp_movimientos')
