@@ -1,13 +1,13 @@
 // belavita-mp-sync — Sincroniza movimientos de la cuenta de Mercado Pago
-// de Belavita hacia Supabase. Arranca en MODO DIAGNÓSTICO: todo lo que
-// trae de la API de MP lo guarda en ops.reserva_mp_raw_log (una tabla
-// aparte, de solo lectura para nosotros), SIN tocar todavía
-// ops.reserva_mp_movimientos (el ledger real que usa el widget "Reserva
-// Belavita" en la app). La idea es primero VER qué tipo de movimientos
-// trae la cuenta real (ventas, rendimiento diario, retiros, etc.) y
-// juntos decidir cuáles se suman automáticamente a la Reserva antes de
-// activar eso — así no se mete un número mal clasificado en un ledger de
-// plata real sin haberlo revisado antes.
+// de Belavita hacia Supabase.
+//
+// Guarda TODO lo que trae la API en ops.reserva_mp_raw_log (tabla de
+// diagnóstico, para poder revisar cualquier cosa rara más adelante), y
+// además aplica automáticamente a ops.reserva_mp_movimientos (el ledger
+// real que usa el widget "Reserva Belavita" en la app) SOLO los
+// movimientos de tipo "partition_transfer" — confirmados 1 a 1 contra la
+// pantalla de Reservas de Mercado Pago (ver clasificarYAplicarReserva()
+// más abajo para el detalle de qué se automatiza y qué no).
 //
 // Variables de entorno necesarias (configurar en Railway):
 //   MP_ACCESS_TOKEN       → Access Token de producción de la cuenta de MP de Belavita
@@ -90,13 +90,51 @@ async function calcularFechaDesde() {
   return hace30.toISOString();
 }
 
+// Convierte los movimientos de la Reserva (operation_type='partition_transfer')
+// que todavía no procesamos en filas reales del ledger de
+// ops.reserva_mp_movimientos — es la ÚNICA categoría que confirmamos que
+// corresponde 1 a 1 con los movimientos de "Dinero reservado / Retirar"
+// que se ven en la pantalla de Reservas de Mercado Pago (se probó contra
+// un caso real: $5.000 el 14/7 a las 09:45, coincide exacto).
+//
+// Todo lo demás queda afuera a propósito:
+//  - "Rendimientos" (el ~$340/día) NO llega por esta API — es una
+//    función de la billetera personal sin acceso programático público.
+//    Tomás prefiere seguir cargándolo a mano con el botón "+ SUMAR" del
+//    widget, así que este servicio no lo toca.
+//  - Ventas, pagos a proveedores, etc. no son plata de la Reserva, son la
+//    operatoria normal de la cuenta — no corresponde sumarlos acá.
+async function clasificarYAplicarReserva() {
+  const { data: pendientes, error } = await sb.schema('ops').from('reserva_mp_raw_log')
+    .select('*').eq('operation_type', 'partition_transfer').eq('revisado', false);
+  if (error) throw error;
+  if (!pendientes || !pendientes.length) return { aplicados: 0 };
+
+  const filasLedger = pendientes.map(p => ({
+    monto: p.monto,
+    motivo: 'Automático · Mercado Pago (reserva)',
+    origen_mp_payment_id: p.mp_payment_id,
+  }));
+  const { error: errorInsert } = await sb.schema('ops').from('reserva_mp_movimientos')
+    .upsert(filasLedger, { onConflict: 'origen_mp_payment_id', ignoreDuplicates: true });
+  if (errorInsert) throw errorInsert;
+
+  const ids = pendientes.map(p => p.id);
+  const { error: errorUpdate } = await sb.schema('ops').from('reserva_mp_raw_log')
+    .update({ revisado: true }).in('id', ids);
+  if (errorUpdate) throw errorUpdate;
+
+  return { aplicados: filasLedger.length };
+}
+
 async function sincronizar() {
   const desde = await calcularFechaDesde();
   const hasta = new Date().toISOString();
   const pagos = await fetchPagosMP(desde, hasta);
   const resultado = await guardarLogCrudo(pagos);
-  console.log(`[sync] ${new Date().toISOString()} · ${resultado.nuevos} movimientos guardados (rango ${desde} → ${hasta})`);
-  return resultado;
+  const clasificacion = await clasificarYAplicarReserva();
+  console.log(`[sync] ${new Date().toISOString()} · ${resultado.nuevos} guardados, ${clasificacion.aplicados} aplicados a la Reserva (rango ${desde} → ${hasta})`);
+  return { ...resultado, ...clasificacion };
 }
 
 app.get('/health', (req, res) => res.json({ ok: true }));
