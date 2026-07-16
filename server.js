@@ -11,6 +11,9 @@
 //
 // Variables de entorno necesarias (configurar en Railway):
 //   MP_ACCESS_TOKEN       → Access Token de producción de la cuenta de MP de Belavita
+//   MP_WEBHOOK_SECRET     → Clave secreta que da el panel de MP al configurar
+//                           el webhook (Tus integraciones → Webhooks) — NO
+//                           es el Access Token, es otra clave distinta
 //   SUPABASE_URL          → misma URL que usa belavita-ops
 //   SUPABASE_SERVICE_KEY  → Service Role Key de Supabase (NO la anon key —
 //                           esta sí puede escribir sin pasar por RLS,
@@ -21,12 +24,14 @@
 
 const express = require('express');
 const fetch = require('node-fetch');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(express.json());
 
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
@@ -157,6 +162,113 @@ app.post('/sync', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`belavita-mp-sync escuchando en :${PORT}`));
+
+// ═══════════════════════════════════════════════════════════════
+// WEBHOOK DE MERCADO PAGO — recibe el aviso al instante cuando llega una
+// transferencia (a diferencia del /sync de arriba, que solo mira cada 6
+// horas). Sirve para que la comandera imprima sola apenas se confirma el
+// pago de una venta hecha con "Mercado Pago" (MP Belavita).
+//
+// Cómo matchea: busca en ventas_pos una venta con medio_pago='mercado_pago',
+// estado_pago='pendiente' y el mismo monto exacto, en las últimas 3 horas.
+//  - Si encuentra UNA sola → la marca 'confirmado' (index.html la detecta
+//    sola por polling y dispara la impresión).
+//  - Si no encuentra ninguna → no hace nada (puede ser una transferencia
+//    que no es de una venta, ej. un cliente que pagó algo aparte).
+//  - Si encuentra DOS O MÁS (dos sucursales pidiendo el mismo monto a la
+//    vez) → NO ADIVINA. Las marca 'ambiguo' para que se resuelva a mano
+//    desde la app — es la limitación real que ya habíamos hablado.
+// ═══════════════════════════════════════════════════════════════
+
+// Verifica que la notificación realmente venga de Mercado Pago, usando la
+// clave secreta que te da el panel de MP al configurar el webhook (NO es
+// el Access Token). Sin esto, cualquiera podría mandarle una notificación
+// falsa a este endpoint diciendo "ya te pagaron".
+function validarFirmaMP(req) {
+  if (!MP_WEBHOOK_SECRET) {
+    console.error('[webhook-mp] Falta MP_WEBHOOK_SECRET — se rechaza la notificación por seguridad');
+    return false;
+  }
+  const xSignature = req.headers['x-signature'];
+  const xRequestId = req.headers['x-request-id'];
+  const dataId = req.query['data.id'] || req.body?.data?.id;
+  if (!xSignature || !xRequestId || !dataId) return false;
+
+  const partes = {};
+  xSignature.split(',').forEach(p => {
+    const [k, v] = p.split('=');
+    if (k && v) partes[k.trim()] = v.trim();
+  });
+  if (!partes.ts || !partes.v1) return false;
+
+  const manifest = `id:${dataId};request-id:${xRequestId};ts:${partes.ts};`;
+  const hmac = crypto.createHmac('sha256', MP_WEBHOOK_SECRET).update(manifest).digest('hex');
+  // Comparación en tiempo constante — evita filtrar información por
+  // cuánto tarda la comparación (buena práctica para comparar firmas)
+  const bufA = Buffer.from(hmac);
+  const bufB = Buffer.from(partes.v1);
+  return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+}
+
+async function intentarConfirmarVenta(pago) {
+  const monto = pago.transaction_amount;
+  const desde = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(); // ventana de 3hs
+
+  const { data: candidatas, error } = await sb.schema('ops').from('ventas_pos')
+    .select('id, sucursal_id, monto_total, created_at')
+    .eq('medio_pago', 'mercado_pago')
+    .eq('estado_pago', 'pendiente')
+    .eq('monto_total', monto)
+    .gte('created_at', desde);
+  if (error) { console.error('[webhook-mp]', error); return; }
+
+  if (!candidatas || candidatas.length === 0) {
+    console.log(`[webhook-mp] Transferencia de $${monto} recibida, sin venta pendiente que coincida`);
+    return;
+  }
+  if (candidatas.length > 1) {
+    await sb.schema('ops').from('ventas_pos').update({ estado_pago: 'ambiguo' })
+      .in('id', candidatas.map(c => c.id));
+    console.log(`[webhook-mp] Ambigüedad: ${candidatas.length} ventas pendientes por $${monto} — requiere resolución manual`);
+    return;
+  }
+
+  await sb.schema('ops').from('ventas_pos').update({
+    estado_pago: 'confirmado', pago_confirmado_en: new Date().toISOString(),
+  }).eq('id', candidatas[0].id);
+  console.log(`[webhook-mp] Venta ${candidatas[0].id} confirmada por transferencia de $${monto}`);
+}
+
+app.post('/webhook-mp', async (req, res) => {
+  // Responder rápido (MP espera 200 en menos de 22 segundos) — el
+  // procesamiento real sigue después, sin bloquear la respuesta
+  res.sendStatus(200);
+
+  try {
+    if (!validarFirmaMP(req)) {
+      console.error('[webhook-mp] Firma inválida — notificación ignorada');
+      return;
+    }
+    const dataId = req.query['data.id'] || req.body?.data?.id;
+    const type = req.query['type'] || req.body?.type;
+    if (type !== 'payment' || !dataId) return; // no nos interesan otros tópicos
+
+    const resPago = await fetch(`https://api.mercadopago.com/v1/payments/${dataId}`, {
+      headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+    });
+    if (!resPago.ok) { console.error('[webhook-mp] no se pudo traer el pago', dataId); return; }
+    const pago = await resPago.json();
+
+    if (pago.status !== 'approved') return;
+    // Solo transferencias/acreditaciones de dinero — no tarjetas ni otros
+    // medios que ya tienen su propio flujo
+    if (!['money_transfer', 'account_fund'].includes(pago.operation_type)) return;
+
+    await intentarConfirmarVenta(pago);
+  } catch (e) {
+    console.error('[webhook-mp] error', e);
+  }
+});
 
 // Sincronización automática cada 6 horas, solo si se activa explícito
 if (process.env.RUN_SCHEDULER === 'true') {
