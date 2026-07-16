@@ -19,8 +19,10 @@
 //                           esta sí puede escribir sin pasar por RLS,
 //                           hace falta porque este es un servicio de
 //                           backend, no la app del navegador)
-//   RUN_SCHEDULER         → "true" para que sincronice solo cada 6 horas
-//                           además de poder pedirlo a mano por POST /sync
+//   RUN_SCHEDULER         → "true" para que sincronice solo cada 30 segundos
+//                           (además de poder pedirlo a mano por POST /sync) —
+//                           es el respaldo del webhook para confirmar ventas
+//                           pagadas por transferencia simple
 
 const express = require('express');
 const fetch = require('node-fetch');
@@ -142,8 +144,9 @@ async function sincronizar() {
   const pagos = await fetchPagosMP(desde, hasta);
   const resultado = await guardarLogCrudo(pagos);
   const clasificacion = await clasificarYAplicarReserva();
-  console.log(`[sync] ${new Date().toISOString()} · ${resultado.nuevos} guardados, ${clasificacion.aplicados} aplicados a la Reserva (rango ${desde} → ${hasta})`);
-  return { ...resultado, ...clasificacion };
+  const confirmacionVentas = await confirmarVentasPendientesPorPolling();
+  console.log(`[sync] ${new Date().toISOString()} · ${resultado.nuevos} guardados, ${clasificacion.aplicados} aplicados a la Reserva, ${confirmacionVentas.confirmadas} ventas confirmadas (rango ${desde} → ${hasta})`);
+  return { ...resultado, ...clasificacion, ...confirmacionVentas };
 }
 
 app.get('/health', (req, res) => res.json({ ok: true }));
@@ -210,7 +213,7 @@ function validarFirmaMP(req) {
   return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
 }
 
-async function intentarConfirmarVenta(pago) {
+async function intentarConfirmarVenta(pago, prefijoLog = '[webhook-mp]') {
   const monto = pago.transaction_amount;
   const desde = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(); // ventana de 3hs
 
@@ -220,23 +223,48 @@ async function intentarConfirmarVenta(pago) {
     .eq('estado_pago', 'pendiente')
     .eq('monto_total', monto)
     .gte('created_at', desde);
-  if (error) { console.error('[webhook-mp]', error); return; }
+  if (error) { console.error(prefijoLog, error); return false; }
 
   if (!candidatas || candidatas.length === 0) {
-    console.log(`[webhook-mp] Transferencia de $${monto} recibida, sin venta pendiente que coincida`);
-    return;
+    return false;
   }
   if (candidatas.length > 1) {
     await sb.schema('ops').from('ventas_pos').update({ estado_pago: 'ambiguo' })
       .in('id', candidatas.map(c => c.id));
-    console.log(`[webhook-mp] Ambigüedad: ${candidatas.length} ventas pendientes por $${monto} — requiere resolución manual`);
-    return;
+    console.log(`${prefijoLog} Ambigüedad: ${candidatas.length} ventas pendientes por $${monto} — requiere resolución manual`);
+    return false;
   }
 
   await sb.schema('ops').from('ventas_pos').update({
     estado_pago: 'confirmado', pago_confirmado_en: new Date().toISOString(),
   }).eq('id', candidatas[0].id);
-  console.log(`[webhook-mp] Venta ${candidatas[0].id} confirmada por transferencia de $${monto}`);
+  console.log(`${prefijoLog} Venta ${candidatas[0].id} confirmada por transferencia de $${monto}`);
+  return true;
+}
+
+// Respaldo del webhook: las transferencias simples (sin QR/checkout) no
+// siempre disparan el aviso instantáneo de MP — esto ya lo confirmamos
+// con una prueba real. Como plan B, cada vez que corre /sync también
+// revisa los money_transfer/account_fund recientes contra las ventas
+// pendientes, con el mismo criterio de matcheo por monto que el webhook.
+// No es instantáneo, pero corriendo cada 1 minuto (ver RUN_SCHEDULER más
+// abajo) se acerca bastante.
+async function confirmarVentasPendientesPorPolling() {
+  const desde = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+  const { data: pagos, error } = await sb.schema('ops').from('reserva_mp_raw_log')
+    .select('mp_payment_id, monto, operation_type, status, fecha')
+    .in('operation_type', ['money_transfer', 'account_fund'])
+    .eq('status', 'approved')
+    .gte('fecha', desde);
+  if (error) { console.error('[polling]', error); return { confirmadas: 0 }; }
+  if (!pagos || !pagos.length) return { confirmadas: 0 };
+
+  let confirmadas = 0;
+  for (const p of pagos) {
+    const ok = await intentarConfirmarVenta({ transaction_amount: p.monto }, '[polling]');
+    if (ok) confirmadas++;
+  }
+  return { confirmadas };
 }
 
 app.post('/webhook-mp', async (req, res) => {
@@ -271,8 +299,12 @@ app.post('/webhook-mp', async (req, res) => {
 });
 
 // Sincronización automática cada 6 horas, solo si se activa explícito
+// Antes corría cada 6 horas (alcanzaba para la Reserva) — ahora corre
+// cada 30 segundos, porque además sirve de respaldo del webhook para
+// confirmar ventas pagadas por transferencia simple (que no siempre
+// dispara el aviso instantáneo de MP)
 if (process.env.RUN_SCHEDULER === 'true') {
-  const SEIS_HORAS = 6 * 60 * 60 * 1000;
-  setInterval(() => { sincronizar().catch(e => console.error('[sync automático]', e)); }, SEIS_HORAS);
-  console.log('Scheduler activado — sincroniza cada 6 horas');
+  const TREINTA_SEGUNDOS = 30 * 1000;
+  setInterval(() => { sincronizar().catch(e => console.error('[sync automático]', e)); }, TREINTA_SEGUNDOS);
+  console.log('Scheduler activado — sincroniza cada 30 segundos');
 }
