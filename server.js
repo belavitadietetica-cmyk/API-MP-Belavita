@@ -215,7 +215,20 @@ function validarFirmaMP(req) {
 
 async function intentarConfirmarVenta(pago, prefijoLog = '[webhook-mp]') {
   const monto = pago.transaction_amount;
+  const paymentId = String(pago.id || pago.mp_payment_id || '');
   const desde = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(); // ventana de 3hs
+
+  // CLAVE: si esta transferencia puntual YA se usó antes para confirmar
+  // otra venta, no se vuelve a usar — sin este chequeo, una transferencia
+  // vieja podía "confirmar" una venta nueva del mismo monto que en
+  // realidad nunca se pagó (bug real detectado en producción: una prueba
+  // de $10 confirmó, 10 minutos después, otra venta de $10 sin que hubiera
+  // ninguna transferencia nueva).
+  if (paymentId) {
+    const { data: yaUsado } = await sb.schema('ops').from('ventas_pos')
+      .select('id').eq('confirmado_por_mp_payment_id', paymentId).limit(1);
+    if (yaUsado && yaUsado.length) return false;
+  }
 
   const { data: candidatas, error } = await sb.schema('ops').from('ventas_pos')
     .select('id, sucursal_id, monto_total, created_at')
@@ -237,8 +250,9 @@ async function intentarConfirmarVenta(pago, prefijoLog = '[webhook-mp]') {
 
   await sb.schema('ops').from('ventas_pos').update({
     estado_pago: 'confirmado', pago_confirmado_en: new Date().toISOString(),
+    confirmado_por_mp_payment_id: paymentId || null,
   }).eq('id', candidatas[0].id);
-  console.log(`${prefijoLog} Venta ${candidatas[0].id} confirmada por transferencia de $${monto}`);
+  console.log(`${prefijoLog} Venta ${candidatas[0].id} confirmada por transferencia ${paymentId || '(sin id)'} de $${monto}`);
   return true;
 }
 
@@ -247,8 +261,8 @@ async function intentarConfirmarVenta(pago, prefijoLog = '[webhook-mp]') {
 // con una prueba real. Como plan B, cada vez que corre /sync también
 // revisa los money_transfer/account_fund recientes contra las ventas
 // pendientes, con el mismo criterio de matcheo por monto que el webhook.
-// No es instantáneo, pero corriendo cada 1 minuto (ver RUN_SCHEDULER más
-// abajo) se acerca bastante.
+// No es instantáneo, pero corriendo cada 30 segundos (ver RUN_SCHEDULER
+// más abajo) se acerca bastante.
 async function confirmarVentasPendientesPorPolling() {
   const desde = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
   const { data: pagos, error } = await sb.schema('ops').from('reserva_mp_raw_log')
@@ -261,7 +275,7 @@ async function confirmarVentasPendientesPorPolling() {
 
   let confirmadas = 0;
   for (const p of pagos) {
-    const ok = await intentarConfirmarVenta({ transaction_amount: p.monto }, '[polling]');
+    const ok = await intentarConfirmarVenta({ transaction_amount: p.monto, id: p.mp_payment_id }, '[polling]');
     if (ok) confirmadas++;
   }
   return { confirmadas };
