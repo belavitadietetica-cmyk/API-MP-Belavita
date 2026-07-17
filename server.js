@@ -230,12 +230,14 @@ async function intentarConfirmarVenta(pago, prefijoLog = '[webhook-mp]') {
     if (yaUsado && yaUsado.length) return false;
   }
 
+  // Matchea dos casos: una venta normal por Mercado Pago (monto_total) o
+  // una venta con pago dividido donde la porción de MP Belavita
+  // (monto_mp_belavita) coincide con lo que llegó
   const { data: candidatas, error } = await sb.schema('ops').from('ventas_pos')
-    .select('id, sucursal_id, monto_total, created_at')
-    .eq('medio_pago', 'mercado_pago')
+    .select('id, sucursal_id, monto_total, monto_mp_belavita, medio_pago, created_at')
     .eq('estado_pago', 'pendiente')
-    .eq('monto_total', monto)
-    .gte('created_at', desde);
+    .gte('created_at', desde)
+    .or(`and(medio_pago.eq.mercado_pago,monto_total.eq.${monto}),and(medio_pago.eq.dividido,monto_mp_belavita.eq.${monto})`);
   if (error) { console.error(prefijoLog, error); return false; }
 
   if (!candidatas || candidatas.length === 0) {
