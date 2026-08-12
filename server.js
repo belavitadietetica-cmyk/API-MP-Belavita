@@ -2,12 +2,11 @@
 // de Belavita hacia Supabase.
 //
 // Guarda TODO lo que trae la API en ops.reserva_mp_raw_log (tabla de
-// diagnóstico, para poder revisar cualquier cosa rara más adelante), y
-// además aplica automáticamente a ops.reserva_mp_movimientos (el ledger
-// real que usa el widget "Reserva Belavita" en la app) SOLO los
-// movimientos de tipo "partition_transfer" — confirmados 1 a 1 contra la
-// pantalla de Reservas de Mercado Pago (ver clasificarYAplicarReserva()
-// más abajo para el detalle de qué se automatiza y qué no).
+// diagnóstico, para poder revisar cualquier cosa rara más adelante).
+//
+// NO toca ops.reserva_mp_movimientos — el ledger de la "Reserva Belavita"
+// es de carga manual. Se puede reactivar con APLICAR_RESERVA_AUTO=true,
+// pero por defecto está apagado (ver clasificarYAplicarReserva()).
 //
 // Variables de entorno necesarias (configurar en Railway):
 //   MP_ACCESS_TOKEN       → Access Token de producción de la cuenta de MP de Belavita
@@ -114,11 +113,44 @@ async function calcularFechaDesde() {
 //    widget, así que este servicio no lo toca.
 //  - Ventas, pagos a proveedores, etc. no son plata de la Reserva, son la
 //    operatoria normal de la cuenta — no corresponde sumarlos acá.
+//
+// ── APAGADO EL 12/8/2026 ────────────────────────────────────────────────
+// Este servicio escribía solo en la Reserva Belavita, y eso se decidió
+// cortar: la reserva vuelve a ser 100% manual.
+//
+// El motivo no es que la clasificación estuviera mal. Es que la plata que
+// aparecía sola no coincidía con lo que Alejandro veía en Mercado Pago, y
+// un saldo que nadie puede explicar es peor que uno que hay que cargar a
+// mano. Además el widget de la app dice, textual, "este saldo no se
+// actualiza solo" — el sistema estaba contradiciendo su propio cartel.
+//
+// Lo que NO cambia: el registro crudo en ops.reserva_mp_raw_log se sigue
+// guardando igual. Así que sigue estando el detalle completo de lo que
+// informa Mercado Pago para poder revisarlo o conciliarlo cuando haga
+// falta; lo único que se corta es la escritura automática en el ledger.
+//
+// Si algún día se quiere volver a activar, se pone APLICAR_RESERVA_AUTO
+// en "true" en Railway. Por defecto está apagado: para que se prenda
+// tiene que ser una decisión explícita de alguien, no un descuido.
+//
+const APLICAR_RESERVA_AUTO = process.env.APLICAR_RESERVA_AUTO === 'true';
+
 async function clasificarYAplicarReserva() {
   const { data: pendientes, error } = await sb.schema('ops').from('reserva_mp_raw_log')
     .select('*').eq('operation_type', 'partition_transfer').eq('revisado', false);
   if (error) throw error;
-  if (!pendientes || !pendientes.length) return { aplicados: 0 };
+  if (!pendientes || !pendientes.length) return { aplicados: 0, pendientes: 0 };
+
+  if (!APLICAR_RESERVA_AUTO) {
+    // Se marcan como revisados igual: si no, cada sincronización volvería
+    // a levantar los mismos y el contador crecería para siempre. La fila
+    // cruda queda intacta en reserva_mp_raw_log con todo su detalle.
+    const ids = pendientes.map(p => p.id);
+    const { error: errorUpdate } = await sb.schema('ops').from('reserva_mp_raw_log')
+      .update({ revisado: true }).in('id', ids);
+    if (errorUpdate) throw errorUpdate;
+    return { aplicados: 0, omitidos: pendientes.length };
+  }
 
   const filasLedger = pendientes.map(p => ({
     monto: p.monto,
@@ -145,7 +177,10 @@ async function sincronizar() {
   const resultado = await guardarLogCrudo(pagos);
   const clasificacion = await clasificarYAplicarReserva();
   const confirmacionVentas = await confirmarVentasPendientesPorPolling();
-  console.log(`[sync] ${new Date().toISOString()} · ${resultado.nuevos} guardados, ${clasificacion.aplicados} aplicados a la Reserva, ${confirmacionVentas.confirmadas} ventas confirmadas (rango ${desde} → ${hasta})`);
+  const detalleReserva = APLICAR_RESERVA_AUTO
+    ? `${clasificacion.aplicados} aplicados a la Reserva`
+    : `${clasificacion.omitidos || 0} de Reserva NO aplicados (carga manual)`;
+  console.log(`[sync] ${new Date().toISOString()} · ${resultado.nuevos} guardados, ${detalleReserva}, ${confirmacionVentas.confirmadas} ventas confirmadas (rango ${desde} → ${hasta})`);
   return { ...resultado, ...clasificacion, ...confirmacionVentas };
 }
 
