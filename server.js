@@ -481,6 +481,19 @@ async function usuarioDe(req) {
 }
 const esAdmin = u => !!u && (u.permisos?.admin === true || /^(due|admin)/i.test(String(u.rol_acceso || '')));
 
+// La cuenta de Mercado Pago de una credencial (para el diagnóstico).
+async function cuentaDe(token) {
+  if (!token) return null;
+  try {
+    const r = await fetch(MP_API + '/users/me', { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) return null;
+    const u = await r.json();
+    const mail = String(u.email || '');
+    const oculto = mail.includes('@') ? mail.slice(0, 6) + '…@' + mail.split('@')[1] : mail;
+    return { id: u.id, nombre: u.nickname || null, email: oculto || null, prueba: Array.isArray(u.tags) && u.tags.includes('test_user') };
+  } catch (e) { return null; }
+}
+
 async function posnetDeSucursal(sucursalId) {
   const { data, error } = await sb.schema('ops').from('posnets')
     .select('terminal_id, nombre').eq('sucursal_id', sucursalId).eq('proveedor', 'mercadopago').eq('activo', true)
@@ -637,10 +650,26 @@ app.get('/posnet/terminales', async (req, res) => {
     const u = await usuarioDe(req);
     if (!esAdmin(u)) return res.status(403).json({ ok: false, error: 'Solo un administrador.' });
     const r = await mp('GET', '/terminals/v1/list?limit=50');
-    const terminales = (r && r.data && r.data.terminals) || [];
+    let terminales = (r && r.data && r.data.terminals) || [];
+    let fuente = 'orders';
+    // Si la lista nueva viene vacía, se prueba la anterior (la de Payment
+    // Intent): algunas cuentas todavía ven ahí sus posnets.
+    if (!terminales.length) {
+      try {
+        const l = await mp('GET', '/point/integration-api/devices?limit=50');
+        const d = (l && l.devices) || [];
+        if (d.length) { terminales = d.map(x => ({ id: x.id, operating_mode: x.operating_mode })); fuente = 'anterior'; }
+      } catch (e) { /* sin la lista anterior */ }
+    }
     const { data: vinculos } = await sb.schema('ops').from('posnets').select('terminal_id, sucursal_id, nombre, activo, proveedor');
-    res.json({ ok: true, terminales: terminales.map(t => ({ id: t.id, modo: t.operating_mode,
-      vinculo: (vinculos || []).find(x => x.terminal_id === t.id) || null })) });
+    // De qué cuenta es cada credencial: si la del posnet no es la dueña de
+    // los posnets, Mercado Pago devuelve la lista vacía.
+    const [cuentaPosnet, cuentaTransferencias] = await Promise.all([cuentaDe(MP_POINT_ACCESS_TOKEN), cuentaDe(MP_ACCESS_TOKEN)]);
+    res.json({ ok: true, fuente, terminales: terminales.map(t => ({ id: t.id, modo: t.operating_mode,
+      vinculo: (vinculos || []).find(x => x.terminal_id === t.id) || null })),
+      cuenta_posnet: cuentaPosnet, cuenta_transferencias: cuentaTransferencias,
+      misma_cuenta: !!(cuentaPosnet && cuentaTransferencias && String(cuentaPosnet.id) === String(cuentaTransferencias.id)),
+      credencial_de_prueba: /^TEST-/.test(String(MP_POINT_ACCESS_TOKEN || '')) || !!(cuentaPosnet && cuentaPosnet.prueba) });
   } catch (e) {
     console.error('[posnet/terminales]', e.message);
     res.status(500).json({ ok: false, error: e.message });
