@@ -25,9 +25,14 @@
 // el monto de la venta al posnet de esa sucursal. Cuando el posnet aprueba,
 // Mercado Pago avisa acá y la venta queda pagada: la caja la ve e imprime la
 // factura, igual que con la transferencia. Ver la sección POSNET al final.
-// No usa variables nuevas: es la misma cuenta y el mismo Access Token. En el
-// panel de Mercado Pago (Tus integraciones → Webhooks) hay que tildar
-// además el tópico "Order" en la misma dirección de /webhook-mp.
+// El posnet usa su propia aplicación de Mercado Pago (una de "Pagos
+// presenciales · Point"): la de siempre no tiene permiso para manejar
+// posnets y Mercado Pago responde 403 "At least one policy returned
+// UNAUTHORIZED". Variables (las dos opcionales; sin ellas usa las de arriba):
+//   MP_POINT_ACCESS_TOKEN   → Access Token de producción de la aplicación del posnet
+//   MP_POINT_WEBHOOK_SECRET → la clave secreta de los Webhooks de ESA aplicación
+// En esa aplicación, Webhooks: la misma dirección de /webhook-mp, con el
+// tópico "Order (Mercado Pago)".
 //                           (además de poder pedirlo a mano por POST /sync) —
 //                           es el respaldo del webhook para confirmar ventas
 //                           pagadas por transferencia simple
@@ -42,6 +47,10 @@ app.use(express.json());
 
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET;
+// La aplicación del posnet (Point) tiene su propia credencial y su propia
+// clave de avisos. Si no están cargadas, se usan las de arriba.
+const MP_POINT_ACCESS_TOKEN = process.env.MP_POINT_ACCESS_TOKEN || process.env.MP_ACCESS_TOKEN;
+const MP_POINT_WEBHOOK_SECRET = process.env.MP_POINT_WEBHOOK_SECRET || null;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
@@ -250,12 +259,16 @@ function validarFirmaMP(req) {
   if (!partes.ts || !partes.v1) return false;
 
   const manifest = `id:${dataId};request-id:${xRequestId};ts:${partes.ts};`;
-  const hmac = crypto.createHmac('sha256', MP_WEBHOOK_SECRET).update(manifest).digest('hex');
-  // Comparación en tiempo constante — evita filtrar información por
-  // cuánto tarda la comparación (buena práctica para comparar firmas)
-  const bufA = Buffer.from(hmac);
+  // Vale con la clave de cualquiera de las dos aplicaciones: la de siempre
+  // (transferencias) o la del posnet, que firma sus avisos con la suya.
   const bufB = Buffer.from(partes.v1);
-  return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+  return [MP_WEBHOOK_SECRET, MP_POINT_WEBHOOK_SECRET].filter(Boolean).some(clave => {
+    const hmac = crypto.createHmac('sha256', clave).update(manifest).digest('hex');
+    // Comparación en tiempo constante — evita filtrar información por
+    // cuánto tarda la comparación (buena práctica para comparar firmas)
+    const bufA = Buffer.from(hmac);
+    return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+  });
 }
 
 async function intentarConfirmarVenta(pago, prefijoLog = '[webhook-mp]') {
@@ -420,7 +433,7 @@ async function mp(metodo, ruta, cuerpo, idempotencia) {
   const r = await fetch(MP_API + ruta, {
     method: metodo,
     headers: {
-      Authorization: `Bearer ${MP_ACCESS_TOKEN}`, 'Content-Type': 'application/json',
+      Authorization: `Bearer ${MP_POINT_ACCESS_TOKEN}`, 'Content-Type': 'application/json',
       ...(idempotencia ? { 'X-Idempotency-Key': idempotencia } : {}),
     },
     body: cuerpo ? JSON.stringify(cuerpo) : undefined,
@@ -430,7 +443,14 @@ async function mp(metodo, ruta, cuerpo, idempotencia) {
   try { datos = texto ? JSON.parse(texto) : null; } catch (e) { datos = { crudo: texto }; }
   if (!r.ok) {
     const motivo = (datos && (datos.message || datos.error || (datos.errors && JSON.stringify(datos.errors)))) || texto;
-    const err = new Error(`Mercado Pago respondió ${r.status}: ${String(motivo).slice(0, 240)}`);
+    // Los dos 403 que se entienden mejor en castellano.
+    let texto403 = null;
+    if (r.status === 403 && /policy returned UNAUTHORIZED/i.test(String(motivo))) {
+      texto403 = 'Mercado Pago no le da permiso a esta credencial para manejar posnets. Hace falta el Access Token de una aplicación de "Pagos presenciales · Point" (MP_POINT_ACCESS_TOKEN en Railway).';
+    } else if (r.status === 403 && /store_pos_not_found/i.test(JSON.stringify(datos || {}))) {
+      texto403 = 'Ese posnet no tiene un local y una caja asignados en Mercado Pago. Asignáselos desde la app de Mercado Pago (Tu negocio → Locales y cajas).';
+    }
+    const err = new Error(texto403 || `Mercado Pago respondió ${r.status}: ${String(motivo).slice(0, 240)}`);
     err.status = r.status; err.datos = datos;
     throw err;
   }
