@@ -19,6 +19,15 @@
 //                           hace falta porque este es un servicio de
 //                           backend, no la app del navegador)
 //   RUN_SCHEDULER         → "true" para que sincronice solo cada 30 segundos
+//                           (también revisa los cobros del posnet en curso)
+//
+// POSNET INTEGRADO (02/10/2026): en la caja, "Mercado Pago → Posnet" manda
+// el monto de la venta al posnet de esa sucursal. Cuando el posnet aprueba,
+// Mercado Pago avisa acá y la venta queda pagada: la caja la ve e imprime la
+// factura, igual que con la transferencia. Ver la sección POSNET al final.
+// No usa variables nuevas: es la misma cuenta y el mismo Access Token. En el
+// panel de Mercado Pago (Tus integraciones → Webhooks) hay que tildar
+// además el tópico "Order" en la misma dirección de /webhook-mp.
 //                           (además de poder pedirlo a mano por POST /sync) —
 //                           es el respaldo del webhook para confirmar ventas
 //                           pagadas por transferencia simple
@@ -177,11 +186,12 @@ async function sincronizar() {
   const resultado = await guardarLogCrudo(pagos);
   const clasificacion = await clasificarYAplicarReserva();
   const confirmacionVentas = await confirmarVentasPendientesPorPolling();
+  const posnet = await revisarCobrosPosnet();
   const detalleReserva = APLICAR_RESERVA_AUTO
     ? `${clasificacion.aplicados} aplicados a la Reserva`
     : `${clasificacion.omitidos || 0} de Reserva NO aplicados (carga manual)`;
   console.log(`[sync] ${new Date().toISOString()} · ${resultado.nuevos} guardados, ${detalleReserva}, ${confirmacionVentas.confirmadas} ventas confirmadas (rango ${desde} → ${hasta})`);
-  return { ...resultado, ...clasificacion, ...confirmacionVentas };
+  return { ...resultado, ...clasificacion, ...confirmacionVentas, ...posnet };
 }
 
 app.get('/health', (req, res) => res.json({ ok: true }));
@@ -272,7 +282,11 @@ async function intentarConfirmarVenta(pago, prefijoLog = '[webhook-mp]') {
     .select('id, sucursal_id, monto_total, monto_mp_belavita, medio_pago, created_at')
     .eq('estado_pago', 'pendiente')
     .gte('created_at', desde)
-    .or(`and(medio_pago.eq.mercado_pago,monto_total.eq.${monto}),and(medio_pago.eq.dividido,monto_mp_belavita.eq.${monto})`);
+    .or(`and(medio_pago.eq.mercado_pago,monto_total.eq.${monto}),and(medio_pago.eq.dividido,monto_mp_belavita.eq.${monto})`)
+    // Las ventas por POSNET no se confirman por monto: tienen su propio
+    // aviso, atado a la venta. Sin este filtro, una transferencia del mismo
+    // monto en otro local podía confirmarlas (o volverlas "ambiguo").
+    .or('datos_extra->>mp_modo.is.null,datos_extra->>mp_modo.neq.posnet');
   if (error) { console.error(prefijoLog, error); return false; }
 
   if (!candidatas || candidatas.length === 0) {
@@ -330,6 +344,13 @@ app.post('/webhook-mp', async (req, res) => {
     }
     const dataId = req.query['data.id'] || req.body?.data?.id;
     const type = req.query['type'] || req.body?.type;
+    // El posnet avisa como "order": se trae la orden y se aplica a su venta.
+    if (type === 'order' && dataId) {
+      const orden = await mp('GET', `/v1/orders/${encodeURIComponent(dataId)}`);
+      const r = await aplicarOrdenPosnet(orden);
+      console.log(`[webhook-mp] posnet ${dataId} → ${r || 'no es de una venta'}`);
+      return;
+    }
     if (type !== 'payment' || !dataId) return; // no nos interesan otros tópicos
 
     const resPago = await fetch(`https://api.mercadopago.com/v1/payments/${dataId}`, {
@@ -359,3 +380,287 @@ if (process.env.RUN_SCHEDULER === 'true') {
   setInterval(() => { sincronizar().catch(e => console.error('[sync automático]', e)); }, TREINTA_SEGUNDOS);
   console.log('Scheduler activado — sincroniza cada 30 segundos');
 }
+
+// ═══════════════════════════════════════════════════════════════
+// POSNET INTEGRADO — Mercado Pago Point (02/10/2026)
+//
+// En la caja: "Mercado Pago" → "Posnet" → Finalizar. La venta se guarda
+// pendiente, marcada con datos_extra.mp_modo = 'posnet', y Cyron pide acá
+// POST /posnet/cobrar. Esto manda el monto al posnet de esa sucursal (la
+// tabla ops.posnets dice cuál es) como una "orden" de Mercado Pago, con la
+// venta como referencia: venta-<id>. El cliente paga en el posnet como
+// quiera (débito, crédito, QR). Mercado Pago avisa a /webhook-mp con el
+// tópico "order", y la venta pasa a 'confirmado': la caja la ve (consulta
+// cada 3 segundos) e imprime la factura en la Hasar.
+//
+// A diferencia de la transferencia, NO se adivina por monto: el cobro va
+// atado a la venta, así que dos locales cobrando lo mismo a la vez no se
+// confunden nunca.
+//
+// Lo que cuida:
+//  · Un cobro por intento, nunca dos: la clave de idempotencia es
+//    venta-<id>-intento-<n>. Si se corta internet justo después de crearlo,
+//    al reintentar Mercado Pago devuelve la misma orden en vez de otra.
+//  · Si ya hay un cobro vivo en el posnet, no se manda otro.
+//  · Un aviso viejo (de un intento anterior que venció) no pisa el estado
+//    del intento actual. Un pago aprobado, en cambio, siempre cuenta.
+//  · Si el aviso no llega, el respaldo de cada 30 segundos consulta la
+//    orden directamente.
+//  · Solo puede pedir cobros un usuario de Cyron con sesión válida; vincular
+//    posnets y cambiarles el modo, solo un administrador.
+//
+// El posnet tiene que estar en modo PDV (integrado). En modo STANDALONE
+// Mercado Pago no le manda órdenes. El modo se cambia desde Cyron
+// (Administración → Posnets), y si un día se cae internet, desde ahí mismo
+// se lo vuelve al modo normal para seguir cobrando con tarjeta a mano.
+// ═══════════════════════════════════════════════════════════════
+const MP_API = 'https://api.mercadopago.com';
+
+async function mp(metodo, ruta, cuerpo, idempotencia) {
+  const r = await fetch(MP_API + ruta, {
+    method: metodo,
+    headers: {
+      Authorization: `Bearer ${MP_ACCESS_TOKEN}`, 'Content-Type': 'application/json',
+      ...(idempotencia ? { 'X-Idempotency-Key': idempotencia } : {}),
+    },
+    body: cuerpo ? JSON.stringify(cuerpo) : undefined,
+  });
+  const texto = await r.text();
+  let datos = null;
+  try { datos = texto ? JSON.parse(texto) : null; } catch (e) { datos = { crudo: texto }; }
+  if (!r.ok) {
+    const motivo = (datos && (datos.message || datos.error || (datos.errors && JSON.stringify(datos.errors)))) || texto;
+    const err = new Error(`Mercado Pago respondió ${r.status}: ${String(motivo).slice(0, 240)}`);
+    err.status = r.status; err.datos = datos;
+    throw err;
+  }
+  return datos;
+}
+
+// Cyron llama desde otra dirección (su web y la app de escritorio).
+app.use('/posnet', (req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// Quién pide: la sesión de Cyron (la misma de Supabase) y su usuario activo.
+async function usuarioDe(req) {
+  const jwt = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  if (!jwt) return null;
+  const { data, error } = await sb.auth.getUser(jwt);
+  const email = data?.user?.email;
+  if (error || !email) return null;
+  const { data: u } = await sb.schema('ops').from('usuarios')
+    .select('id, nombre, email, activo, rol_acceso, permisos').ilike('email', email).maybeSingle();
+  if (!u || u.activo === false) return null;
+  return u;
+}
+const esAdmin = u => !!u && (u.permisos?.admin === true || /^(due|admin)/i.test(String(u.rol_acceso || '')));
+
+async function posnetDeSucursal(sucursalId) {
+  const { data, error } = await sb.schema('ops').from('posnets')
+    .select('terminal_id, nombre').eq('sucursal_id', sucursalId).eq('proveedor', 'mercadopago').eq('activo', true)
+    .limit(1).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+// Anota el estado del cobro en datos_extra.posnet (sin pisar lo demás).
+async function anotarPosnet(ventaId, cambios, columnas = {}) {
+  const { data: v, error: e1 } = await sb.schema('ops').from('ventas_pos').select('datos_extra').eq('id', ventaId).maybeSingle();
+  if (e1) throw e1;
+  const de = (v && v.datos_extra) || {};
+  const posnet = { ...(de.posnet || {}), ...cambios, actualizado: new Date().toISOString() };
+  const { error } = await sb.schema('ops').from('ventas_pos').update({ datos_extra: { ...de, posnet }, ...columnas }).eq('id', ventaId);
+  if (error) throw error;
+  return posnet;
+}
+
+const ESTADOS_VIVOS = ['en_posnet', 'procesando'];
+const ESTADO_ORDEN = {
+  created: 'en_posnet', at_terminal: 'en_posnet', action_required: 'en_posnet', processing: 'procesando',
+  canceled: 'cancelado', expired: 'vencido', failed: 'rechazado', refunded: 'devuelto',
+};
+
+// Aplica lo que dice Mercado Pago de una orden a su venta. Lo usan el aviso,
+// el respaldo de cada 30 segundos y la cancelación.
+async function aplicarOrdenPosnet(orden) {
+  const m = String(orden?.external_reference || '').match(/^venta-(\d+)$/);
+  if (!m) return null;
+  const ventaId = Number(m[1]);
+  const { data: v, error } = await sb.schema('ops').from('ventas_pos').select('estado_pago, datos_extra').eq('id', ventaId).maybeSingle();
+  if (error) throw error;
+  if (!v) return null;
+  const actual = (v.datos_extra && v.datos_extra.posnet) || {};
+  const pago = (orden.transactions && orden.transactions.payments && orden.transactions.payments[0]) || {};
+  const st = String(orden.status || '').toLowerCase();
+
+  if (st === 'processed') {
+    // Pagado. Cuenta aunque sea de un intento anterior: esa plata entró.
+    const pm = pago.payment_method || {};
+    const datos = { estado: 'aprobado', order_id: orden.id, tipo: pm.type || null, marca: pm.id || null,
+      cuotas: pm.installments || null, pago_id: (pago.reference && pago.reference.id) || pago.id || null, detalle: orden.status_detail || null };
+    if (v.estado_pago === 'confirmado') { await anotarPosnet(ventaId, datos); return 'aprobado'; }
+    await anotarPosnet(ventaId, datos, {
+      estado_pago: 'confirmado', pago_confirmado_en: new Date().toISOString(),
+      confirmado_por_mp_payment_id: String(datos.pago_id || orden.id),
+    });
+    // Si había otro intento vivo en el posnet, se cancela: ya está pagada.
+    if (actual.order_id && actual.order_id !== orden.id && ESTADOS_VIVOS.includes(actual.estado)) {
+      try { await mp('POST', `/v1/orders/${encodeURIComponent(actual.order_id)}/cancel`, null, `cancelar-${actual.order_id}`); } catch (e) { /* ya no estaba */ }
+    }
+    return 'aprobado';
+  }
+  // Un aviso de un intento anterior no pisa el estado del intento actual.
+  if (actual.order_id && actual.order_id !== orden.id) return 'viejo';
+  if (v.estado_pago === 'confirmado') return 'ya pagada';
+  const estado = ESTADO_ORDEN[st] || st || 'desconocido';
+  await anotarPosnet(ventaId, { estado, order_id: orden.id, detalle: orden.status_detail || pago.status_detail || null });
+  return estado;
+}
+
+// Respaldo: si un aviso no llegó, cada 30 segundos se consulta la orden.
+async function revisarCobrosPosnet() {
+  const desde = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await sb.schema('ops').from('ventas_pos')
+    .select('id, datos_extra').eq('estado_pago', 'pendiente').gte('created_at', desde).eq('datos_extra->>mp_modo', 'posnet');
+  if (error) { console.error('[posnet/respaldo]', error.message); return { posnet_revisados: 0 }; }
+  let revisados = 0;
+  for (const v of data || []) {
+    const p = (v.datos_extra && v.datos_extra.posnet) || {};
+    if (!p.order_id || !ESTADOS_VIVOS.includes(p.estado)) continue;
+    try { await aplicarOrdenPosnet(await mp('GET', `/v1/orders/${encodeURIComponent(p.order_id)}`)); revisados++; }
+    catch (e) { console.error('[posnet/respaldo]', v.id, e.message); }
+  }
+  return { posnet_revisados: revisados };
+}
+
+async function ventaParaPosnet(id) {
+  const { data: v, error } = await sb.schema('ops').from('ventas_pos')
+    .select('id, sucursal_id, monto_total, monto_mp_belavita, medio_pago, estado_pago, datos_extra, cancelada').eq('id', id).maybeSingle();
+  if (error) throw error;
+  return v;
+}
+
+// La caja pide cobrar una venta en el posnet de su sucursal.
+app.post('/posnet/cobrar', async (req, res) => {
+  try {
+    const u = await usuarioDe(req);
+    if (!u) return res.status(401).json({ ok: false, error: 'La sesión de Cyron no es válida. Volvé a entrar.' });
+    const v = await ventaParaPosnet(Number(req.body && req.body.venta_id));
+    if (!v) return res.status(404).json({ ok: false, error: 'No encuentro esa venta.' });
+    if (v.cancelada) return res.status(409).json({ ok: false, error: 'Esa venta está anulada.' });
+    if (v.estado_pago === 'confirmado') return res.json({ ok: true, ya_pagada: true, estado: 'aprobado' });
+    if (!v.datos_extra || v.datos_extra.mp_modo !== 'posnet') return res.status(400).json({ ok: false, error: 'Esa venta no es por posnet.' });
+    const monto = Number(v.medio_pago === 'dividido' ? v.monto_mp_belavita : v.monto_total);
+    if (!(monto > 0)) return res.status(400).json({ ok: false, error: 'La venta no tiene monto.' });
+    const t = await posnetDeSucursal(v.sucursal_id);
+    if (!t) return res.status(409).json({ ok: false, error: 'Esta sucursal no tiene un posnet vinculado.' });
+
+    const prev = v.datos_extra.posnet || {};
+    if (prev.order_id && ESTADOS_VIVOS.includes(prev.estado)) {
+      return res.json({ ok: true, order_id: prev.order_id, estado: prev.estado, repetido: true });
+    }
+    const intento = (Number(prev.intento) || 0) + 1;
+    const orden = await mp('POST', '/v1/orders', {
+      type: 'point',
+      external_reference: `venta-${v.id}`,
+      description: `Bela Vita · venta ${v.id}`,
+      transactions: { payments: [{ amount: monto.toFixed(2) }] },
+      config: { point: { terminal_id: t.terminal_id, print_on_terminal: 'no_ticket' } },
+    }, `venta-${v.id}-intento-${intento}`);
+    await anotarPosnet(v.id, { order_id: orden.id, terminal_id: t.terminal_id, posnet: t.nombre || null,
+      estado: 'en_posnet', intento, enviado_por: u.nombre || u.email, detalle: null });
+    console.log(`[posnet] venta ${v.id} → ${t.terminal_id} · $${monto} · orden ${orden.id}`);
+    res.json({ ok: true, order_id: orden.id, estado: 'en_posnet' });
+  } catch (e) {
+    console.error('[posnet/cobrar]', e.message);
+    res.status(e.status && e.status < 500 ? 422 : 500).json({ ok: false, error: e.message });
+  }
+});
+
+// Cancelar el cobro que está en el posnet (si todavía no se pagó).
+app.post('/posnet/cancelar', async (req, res) => {
+  try {
+    const u = await usuarioDe(req);
+    if (!u) return res.status(401).json({ ok: false, error: 'La sesión de Cyron no es válida. Volvé a entrar.' });
+    const v = await ventaParaPosnet(Number(req.body && req.body.venta_id));
+    if (!v) return res.status(404).json({ ok: false, error: 'No encuentro esa venta.' });
+    const p = (v.datos_extra && v.datos_extra.posnet) || {};
+    if (v.estado_pago === 'confirmado') return res.json({ ok: false, estado: 'aprobado', error: 'Ya estaba pagada: no se cancela.' });
+    if (!p.order_id || !ESTADOS_VIVOS.includes(p.estado)) {
+      await anotarPosnet(v.id, { estado: 'cancelado', detalle: 'Cancelado desde la caja' });
+      return res.json({ ok: true, estado: 'cancelado' });
+    }
+    try {
+      await mp('POST', `/v1/orders/${encodeURIComponent(p.order_id)}/cancel`, null, `cancelar-${p.order_id}`);
+      await anotarPosnet(v.id, { estado: 'cancelado', detalle: 'Cancelado desde la caja' });
+      return res.json({ ok: true, estado: 'cancelado' });
+    } catch (e) {
+      // No se pudo cancelar: puede que el cliente ya haya pagado. Se mira la orden.
+      const estado = await aplicarOrdenPosnet(await mp('GET', `/v1/orders/${encodeURIComponent(p.order_id)}`));
+      return res.json({ ok: estado !== 'aprobado', estado, error: estado === 'aprobado' ? 'El cliente ya pagó: no se cancela.' : null });
+    }
+  } catch (e) {
+    console.error('[posnet/cancelar]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Administración: los posnets de la cuenta, a qué local está cada uno y su modo.
+app.get('/posnet/terminales', async (req, res) => {
+  try {
+    const u = await usuarioDe(req);
+    if (!esAdmin(u)) return res.status(403).json({ ok: false, error: 'Solo un administrador.' });
+    const r = await mp('GET', '/terminals/v1/list?limit=50');
+    const terminales = (r && r.data && r.data.terminals) || [];
+    const { data: vinculos } = await sb.schema('ops').from('posnets').select('terminal_id, sucursal_id, nombre, activo, proveedor');
+    res.json({ ok: true, terminales: terminales.map(t => ({ id: t.id, modo: t.operating_mode,
+      vinculo: (vinculos || []).find(x => x.terminal_id === t.id) || null })) });
+  } catch (e) {
+    console.error('[posnet/terminales]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/posnet/vincular', async (req, res) => {
+  try {
+    const u = await usuarioDe(req);
+    if (!esAdmin(u)) return res.status(403).json({ ok: false, error: 'Solo un administrador.' });
+    const { terminal_id, sucursal_id, nombre } = req.body || {};
+    if (!terminal_id) return res.status(400).json({ ok: false, error: 'Falta el posnet.' });
+    if (!sucursal_id) {
+      const { error } = await sb.schema('ops').from('posnets').update({ activo: false }).eq('terminal_id', terminal_id);
+      if (error) throw error;
+      return res.json({ ok: true, desvinculado: true });
+    }
+    // Un local, un posnet de Mercado Pago activo: el anterior de ese local se desactiva.
+    await sb.schema('ops').from('posnets').update({ activo: false }).eq('sucursal_id', sucursal_id).eq('proveedor', 'mercadopago').neq('terminal_id', terminal_id);
+    const { error } = await sb.schema('ops').from('posnets').upsert({ terminal_id, sucursal_id, nombre: nombre || null,
+      proveedor: 'mercadopago', activo: true }, { onConflict: 'terminal_id' });
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[posnet/vincular]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Modo integrado (PDV) o normal (STANDALONE). El posnet toma el cambio al reiniciarse.
+app.post('/posnet/modo', async (req, res) => {
+  try {
+    const u = await usuarioDe(req);
+    if (!esAdmin(u)) return res.status(403).json({ ok: false, error: 'Solo un administrador.' });
+    const { terminal_id, modo } = req.body || {};
+    if (!terminal_id || !['PDV', 'STANDALONE'].includes(modo)) return res.status(400).json({ ok: false, error: 'Falta el posnet o el modo.' });
+    const r = await mp('PATCH', '/terminals/v1/setup', { terminals: [{ id: terminal_id, operating_mode: modo }] });
+    res.json({ ok: true, resultado: r });
+  } catch (e) {
+    console.error('[posnet/modo]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
