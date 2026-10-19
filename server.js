@@ -468,14 +468,22 @@ app.use('/posnet', (req, res, next) => {
 });
 
 // Quién pide: la sesión de Cyron (la misma de Supabase) y su usuario activo.
+//
+// (19/10) Por id, no por mail. Antes era .ilike('email', email), y en ilike
+// el "_" y el "%" son comodines: un cliente de la tienda (que también tiene
+// sesión en este Supabase, y elige su mail) podía registrarse como
+// "nombre_apellido@dominio" y pasar por "nombre.apellido@dominio" del equipo,
+// incluso por un dueño. El id de la sesión es el de su fila en ops.usuarios
+// (lo controla permisos-ops.sql y lo usa igual el servidor de la tienda).
 async function usuarioDe(req) {
   const jwt = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
   if (!jwt) return null;
   const { data, error } = await sb.auth.getUser(jwt);
-  const email = data?.user?.email;
-  if (error || !email) return null;
-  const { data: u } = await sb.schema('ops').from('usuarios')
-    .select('id, nombre, email, activo, rol_acceso, permisos').ilike('email', email).maybeSingle();
+  const id = data?.user?.id;
+  if (error || !id) return null;
+  const { data: u, error: eU } = await sb.schema('ops').from('usuarios')
+    .select('id, nombre, email, activo, rol_acceso, permisos').eq('id', id).maybeSingle();
+  if (eU) console.error('[usuarioDe]', eU.message);
   if (!u || u.activo === false) return null;
   return u;
 }
